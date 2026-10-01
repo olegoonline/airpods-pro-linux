@@ -27,12 +27,12 @@ from airpods_aap import (CASE, CMD_ALLOW_OFF_MODE, CMD_ONE_BUD_ANC, LEFT, MODE_T
 from PySide6.QtCore import (Property, QEasingCurve, QObject, QPoint, QPointF,  # noqa: E402
                             QPropertyAnimation, QRectF, QSocketNotifier, Qt, QTimer,
                             QVariantAnimation, Signal)
-from PySide6.QtGui import (QColor, QCursor, QFont, QFontDatabase, QFontMetricsF,  # noqa: E402
+from PySide6.QtGui import (QColor, QFont, QFontDatabase, QFontMetricsF,  # noqa: E402
                            QGuiApplication, QIcon, QImage, QPainter, QPainterPath, QPen,
                            QPixmap, QTransform)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket  # noqa: E402
 from PySide6.QtSvg import QSvgRenderer  # noqa: E402
-from PySide6.QtWidgets import QApplication, QMenu, QWidget  # noqa: E402
+from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
 import media  # noqa: E402
 from sni import TrayItem  # noqa: E402
@@ -784,7 +784,8 @@ class Tray(QObject):
         self.item = TrayItem(APP_ID, "AirPods")
         self.item.activated.connect(self.on_click)
         self.item.secondary.connect(lambda x, y: conn.cycle())
-        self.item.context.connect(self.on_menu)
+        self.item.menu_clicked.connect(self.on_menu_clicked)
+        self._last_menu = None
         conn.changed.connect(self.refresh)
         self._last_icon = None
         self.refresh()
@@ -795,26 +796,41 @@ class Tray(QObject):
         elif not self.widget.recently_hidden():  # that click on the icon just closed it
             self.widget.popup_at(x, y)
 
-    def on_menu(self, x, y):
-        menu = QMenu()
-        menu.addAction("Open AirPods", self.window.show_raised)
-        menu.addSeparator()
+    # Right-click menu, drawn by Plasma itself over DBusMenu.
+    MENU_OPEN, MENU_RELAUNCH, MENU_QUIT = 1, 2, 3
+    MENU_MODE = 10  # + listening mode value
+
+    def menu_items(self):
         pods = self.conn.pods
+        items = [{"id": self.MENU_OPEN, "label": "Open AirPods"},
+                 {"id": 4, "separator": True}]
         for mode in (ANC, TRANSPARENCY, OFF):
-            act = menu.addAction(MODE_TITLES[mode], lambda m=mode: self.conn.set_mode(m))
-            act.setCheckable(True)
-            act.setChecked(bool(pods and pods.mode == mode))
-            act.setEnabled(pods is not None)
-        menu.addSeparator()
-        menu.addAction("Relaunch", relaunch)
-        menu.addAction("Quit", QApplication.quit)
-        menu.exec(QPoint(x, y) if (x or y) else QCursor.pos())
+            items.append({"id": self.MENU_MODE + mode, "label": MODE_TITLES[mode],
+                          "checked": bool(pods and pods.mode == mode), "enabled": pods is not None})
+        items += [{"id": 5, "separator": True},
+                  {"id": self.MENU_RELAUNCH, "label": "Relaunch"},
+                  {"id": self.MENU_QUIT, "label": "Quit"}]
+        return items
+
+    def on_menu_clicked(self, item_id):
+        if item_id == self.MENU_OPEN:
+            self.window.show_raised()
+        elif item_id == self.MENU_RELAUNCH:
+            relaunch()
+        elif item_id == self.MENU_QUIT:
+            QApplication.quit()
+        elif item_id - self.MENU_MODE in (ANC, TRANSPARENCY, OFF):
+            self.conn.set_mode(item_id - self.MENU_MODE)
 
     def refresh(self):
         pods = self.conn.pods
         connected = pods is not None
         levels = [v for v in (self.conn.level(LEFT), self.conn.level(RIGHT)) if v is not None]
         level = min(levels) if levels else None
+        menu_key = (connected, pods.mode if pods else None)
+        if menu_key != self._last_menu:
+            self._last_menu = menu_key
+            self.item.set_menu(self.menu_items())
         key = (connected, level)
         if key != self._last_icon:
             self._last_icon = key

@@ -17,6 +17,8 @@ from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QImage
 
 ITEM_IFACE = "org.kde.StatusNotifierItem"
+MENU_IFACE = "com.canonical.dbusmenu"
+MENU_PATH = "/MenuBar"
 WATCHER = "org.kde.StatusNotifierWatcher"
 PROPS_IFACE = "org.freedesktop.DBus.Properties"
 PATH = "/StatusNotifierItem"
@@ -55,7 +57,9 @@ class _Item(dbus.service.Object):
             "AttentionMovieName": "",
             "ToolTip": dbus.Struct(("", dbus.Array([], signature="(iiay)"), title, ""), signature="sa(iiay)ss"),
             "ItemIsMenu": False,
-            "Menu": dbus.ObjectPath("/NO_DBUSMENU"),
+            # Plasma draws this menu natively, so it closes on outside clicks
+            # (a Qt menu under XWayland never sees clicks on Wayland surfaces).
+            "Menu": dbus.ObjectPath(MENU_PATH),
         }
 
     # -- org.kde.StatusNotifierItem ------------------------------------------
@@ -101,12 +105,97 @@ class _Item(dbus.service.Object):
         return dbus.Dictionary(self.props, signature="sv")
 
 
+class _Menu(dbus.service.Object):
+    """com.canonical.dbusmenu: a flat menu of labels, checkmarks and separators."""
+
+    def __init__(self, bus, bridge):
+        super().__init__(bus, MENU_PATH)
+        self.bridge = bridge
+        self.items = []      # [{"id", "label", "enabled", "checked", "separator"}]
+        self.revision = 1
+
+    def _props(self, item):
+        if item.get("separator"):
+            return dbus.Dictionary({"type": "separator"}, signature="sv")
+        props = {"label": item["label"], "enabled": bool(item.get("enabled", True))}
+        if item.get("checked") is not None:
+            props["toggle-type"] = "radio"
+            props["toggle-state"] = dbus.Int32(1 if item["checked"] else 0)
+        return dbus.Dictionary(props, signature="sv")
+
+    def _node(self, item):
+        return dbus.Struct((dbus.Int32(item["id"]), self._props(item), dbus.Array([], signature="v")),
+                           signature="ia{sv}av")
+
+    def set_items(self, items):
+        self.items = items
+        self.revision += 1
+        self.LayoutUpdated(dbus.UInt32(self.revision), dbus.Int32(0))
+
+    @dbus.service.method(MENU_IFACE, in_signature="iias", out_signature="u(ia{sv}av)")
+    def GetLayout(self, parent_id, depth, names):
+        children = dbus.Array([self._node(i) for i in self.items], signature="v")
+        root = dbus.Struct((dbus.Int32(0), dbus.Dictionary({"children-display": "submenu"}, signature="sv"),
+                            children), signature="ia{sv}av")
+        return dbus.UInt32(self.revision), root
+
+    @dbus.service.method(MENU_IFACE, in_signature="aias", out_signature="a(ia{sv})")
+    def GetGroupProperties(self, ids, names):
+        wanted = set(int(i) for i in ids)
+        return dbus.Array([dbus.Struct((dbus.Int32(i["id"]), self._props(i)), signature="ia{sv}")
+                           for i in self.items if not wanted or i["id"] in wanted], signature="(ia{sv})")
+
+    @dbus.service.method(MENU_IFACE, in_signature="is", out_signature="v")
+    def GetProperty(self, item_id, name):
+        for i in self.items:
+            if i["id"] == item_id:
+                return self._props(i).get(name, "")
+        return ""
+
+    @dbus.service.method(MENU_IFACE, in_signature="isvu")
+    def Event(self, item_id, event_id, data, timestamp):
+        if event_id == "clicked":
+            self.bridge.menu_clicked.emit(int(item_id))
+
+    @dbus.service.method(MENU_IFACE, in_signature="a(isvu)", out_signature="ai")
+    def EventGroup(self, events):
+        for item_id, event_id, data, timestamp in events:
+            self.Event(item_id, event_id, data, timestamp)
+        return dbus.Array([], signature="i")
+
+    @dbus.service.method(MENU_IFACE, in_signature="i", out_signature="b")
+    def AboutToShow(self, item_id):
+        return False
+
+    @dbus.service.method(MENU_IFACE, in_signature="ai", out_signature="aiai")
+    def AboutToShowGroup(self, ids):
+        return dbus.Array([], signature="i"), dbus.Array([], signature="i")
+
+    @dbus.service.signal(MENU_IFACE, signature="ui")
+    def LayoutUpdated(self, revision, parent):
+        pass
+
+    @dbus.service.signal(MENU_IFACE, signature="a(ia{sv})a(ias)")
+    def ItemsPropertiesUpdated(self, updated, removed):
+        pass
+
+    @dbus.service.method(PROPS_IFACE, in_signature="ss", out_signature="v")
+    def Get(self, iface, name):
+        return self.GetAll(iface)[name]
+
+    @dbus.service.method(PROPS_IFACE, in_signature="s", out_signature="a{sv}")
+    def GetAll(self, iface):
+        return dbus.Dictionary({"Version": dbus.UInt32(3), "TextDirection": "ltr", "Status": "normal",
+                                "IconThemePath": dbus.Array([], signature="s")}, signature="sv")
+
+
 class TrayItem(QObject):
     """Qt-side handle: signals carry the click position in global coordinates."""
 
     activated = Signal(int, int)    # left click
     secondary = Signal(int, int)    # middle click
-    context = Signal(int, int)      # right click
+    context = Signal(int, int)      # right click (only without a menu)
+    menu_clicked = Signal(int)      # id of the DBusMenu entry
 
     def __init__(self, app_id, title):
         super().__init__()
@@ -122,6 +211,7 @@ class TrayItem(QObject):
         name = f"org.kde.StatusNotifierItem-{os.getpid()}-1"
         self._name = dbus.service.BusName(name, bus)
         self._item = _Item(bus, self, app_id, title)
+        self._menu = _Menu(bus, self)
 
         def register():
             try:
@@ -147,6 +237,11 @@ class TrayItem(QObject):
             self._item.props["IconPixmap"] = data
             self._item.NewIcon()
         self._call(apply)
+
+    def set_menu(self, items):
+        """items: dicts with id, label, enabled, checked (None for a plain entry) or separator."""
+        items = [dict(i) for i in items]
+        self._call(lambda: self._menu.set_items(items))
 
     def set_tooltip(self, title, text):
         def apply():
