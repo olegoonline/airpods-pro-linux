@@ -42,6 +42,8 @@ RECONNECT_MS = 5000
 OFF, ANC, TRANSPARENCY = MODES["off"], MODES["anc"], MODES["transparency"]
 # Only the two main modes are offered; pressing the active one again turns it off.
 MODE_BUTTONS = [ANC, TRANSPARENCY]
+SOUND_MODES = {OFF: "off", ANC: "noise cancellation", TRANSPARENCY: "transparency",
+               MODES["adaptive"]: "adaptive"}  # tray tooltip wording
 LOW_BATTERY = 25  # percent; the "Low Battery" frame shows ~25%
 EAR_IN = 0x00     # ear-detection status byte: in ear (0x01 out, 0x02 in case)
 
@@ -817,10 +819,14 @@ class Tray(QObject):
         if key != self._last_icon:
             self._last_icon = key
             self.item.set_icon([tray_icon_image(s, level, connected) for s in TRAY_SIZES])
+        def pct(part):
+            level = self.conn.level(part)
+            return "—" if level is None else f"{level}%"
+
         if connected:
-            body = f"{MODE_TITLES.get(pods.mode, '…')}\n{pods.battery_text()}"
+            body = f"Sound Mode: {SOUND_MODES.get(pods.mode, '…')}\nLeft: {pct(LEFT)}; Right: {pct(RIGHT)}"
         else:
-            body = f"Не подключено\n{self.conn.error or ''}"
+            body = "Disconnected"
         self.item.set_tooltip(Design.title_text, body)
 
 
