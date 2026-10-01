@@ -9,6 +9,7 @@ The app runs on XWayland: on Wayland a client cannot place its own windows, and
 the tray widget has to open right under the tray icon.
 """
 
+import json
 import os
 import sys
 import threading
@@ -182,6 +183,19 @@ class Assets:
 
 # --------------------------------------------------------------------- connection
 
+STATE_FILE = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                          APP_ID, "state.json")
+
+
+def _load_case_level():
+    try:
+        with open(STATE_FILE) as f:
+            level = json.load(f).get("case_level")
+        return level if isinstance(level, int) and 0 <= level <= 100 else None
+    except (OSError, ValueError):
+        return None
+
+
 class Connection(QObject):
     """Keeps an AAP link open, reconnecting whenever the AirPods come back."""
 
@@ -198,6 +212,7 @@ class Connection(QObject):
         self._connecting = False
         self._pending_mode = None
         self._auto_paused = []  # MPRIS players paused by ear detection
+        self._case_level = _load_case_level()
         self._opened.connect(self._on_opened)
         self._failed.connect(self._on_failed)
         self._timer = QTimer(self, interval=RECONNECT_MS, timeout=self.connect_now)
@@ -268,6 +283,7 @@ class Connection(QObject):
             self._pending_mode = None
         if self.pods.ears != ears_before:
             self._on_ears(ears_before, self.pods.ears)
+        self._remember_case()
         self.changed.emit()
 
     def _on_ears(self, before, now):
@@ -302,7 +318,25 @@ class Connection(QObject):
             self.set_mode(TRANSPARENCY if self.pods.mode == ANC else ANC)
 
     def level(self, part):
-        return self.pods.battery_level(part) if self.pods else None
+        if not self.pods:
+            return None
+        live = self.pods.battery_level(part)
+        if part == CASE and live is None:
+            # AirPods only learn the case level while they sit in it with the lid open
+            # (BLE adverts say "unknown" too), so fall back to the last one seen.
+            return self._case_level
+        return live
+
+    def _remember_case(self):
+        live = self.pods.battery_level(CASE)
+        if live is not None and live != self._case_level:
+            self._case_level = live
+            try:
+                os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+                with open(STATE_FILE, "w") as f:
+                    json.dump({"case_level": live, "time": int(time.time())}, f)
+            except OSError:
+                pass
 
     @property
     def worn(self):

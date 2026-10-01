@@ -83,6 +83,8 @@ AirPods expose Apple's private **AAP (Apple Accessory Protocol)** over Bluetooth
 
 **Is spatial audio enabled?** No. Spatial audio is computed by the playing device from head-tracking data; this app never requests head tracking and adds no spatial filters.
 
+**Why is the case battery an older value?** AirPods only know the case level while they sit in the case with the lid open — even Apple's own Bluetooth LE adverts report the case as “unknown” once the buds are in your ears. The app remembers the last reported case level (stored in `~/.config/airpods-tray/state.json`) and shows it until a fresh one arrives; to refresh it, put the buds in the case and open the lid.
+
 **How is this different from LibrePods?** LibrePods is a full-featured multi-platform project. This is a small, focused tray app for AirPods Pro on KDE Plasma with two modes, battery and ear-detection pause.
 
 ---
@@ -115,6 +117,10 @@ AirPods expose Apple's private **AAP (Apple Accessory Protocol)** over Bluetooth
 | Вынули второй или вернули только один | Ничего не меняется |
 | Вернули оба в уши | Воспроизведение **продолжается** — только у плееров, которые остановила программа; ваша собственная пауза остаётся |
 | В ухе один наушник | **Шумоподавление остаётся включённым.** Программа включает «Шумоподавление с одним наушником», и AirPods больше не переключаются сами в прозрачность |
+
+### Заряд кейса
+
+AirPods знают заряд кейса, только пока лежат в нём с открытой крышкой; когда наушники в ушах, даже сами AirPods в Bluetooth LE-рекламе сообщают кейс как «неизвестно». Поэтому программа запоминает последнее значение (`~/.config/airpods-tray/state.json`) и показывает его, пока не придёт новое. Чтобы обновить — положите наушники в кейс и откройте крышку.
 
 ### Установка
 

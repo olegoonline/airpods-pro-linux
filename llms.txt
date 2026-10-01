@@ -7,6 +7,7 @@ Key facts:
 - The graphical interface (window, tray icon, tray widget) is designed for AirPods Pro only; tested on AirPods Pro 3.
 - Ear detection: taking one AirPod out while both were in pauses playing MPRIS players; putting both back resumes only the players the app paused. With one AirPod in, noise cancellation stays on (the app enables the AirPods "Noise Cancellation with One AirPod" setting, control 0x1B = 0x01).
 - Protocol: Apple Accessory Protocol (AAP) over Bluetooth L2CAP PSM 0x1001. Listening mode command: 04 00 04 00 09 00 0D <mode> 00 00 00 (1 off, 2 noise cancellation, 3 transparency). Protocol knowledge from LibrePods (https://github.com/kavishdevar/librepods); this is an independent implementation.
+- Case battery: AirPods report it only while in the case with the lid open (their BLE proximity adverts mark it unknown otherwise), so the app shows the last known case level, persisted in ~/.config/airpods-tray/state.json.
 - On Wayland the app runs via XWayland so the tray widget can be positioned under the KDE tray icon; the tray icon is a custom StatusNotifierItem that receives click coordinates.
 
 ## Docs
