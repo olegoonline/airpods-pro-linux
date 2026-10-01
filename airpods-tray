@@ -10,6 +10,7 @@ the tray widget has to open right under the tray icon.
 """
 
 import json
+import math
 import os
 import sys
 import threading
@@ -50,7 +51,7 @@ EAR_IN = 0x00     # ear-detection status byte: in ear (0x01 out, 0x02 in case)
 
 class Design:
     """Tokens and geometry from the Figma frames (frame-relative coordinates)."""
-    width, height, radius = 320, 480, 18
+    width, height, radius, smoothing = 320, 480, 24, 0.6  # Figma corner smoothing 60%
     bg = QColor("#f5f5f5")
     border = QColor("#ffffff")
     title = QColor("#333333")
@@ -59,21 +60,26 @@ class Design:
     red = QColor("#c7372f")
     control = QColor("#d4d4d4")
     control_glyph = QColor("#4d4d4d")
-    idle = QColor("#cccccc")
+    button_on = QColor(0x96, 0xe3, 0x4f, round(0.32 * 255))
+    button_off = QColor("#e8e8e8")
+    glyph_on = QColor("#76cd26")
+    glyph_off = QColor("#b3b3b3")
     track = QColor("#88898b")
     offline = QColor("#4c4c4c")
 
     title_text = "AirPods Pro 3"
-    title_rect = QRectF(16, 16, 250, 25)
-    subtitle_rect = QRectF(16, 45, 250, 15)
+    title_rect = QRectF(24, 24, 240, 25)
+    subtitle_rect = QRectF(24, 53, 240, 15)
 
     bud_size = (138, 184)
-    bud_left = QPointF(20, 78)
-    bud_right = QPointF(158, 149.11111)
-    bar_left = QRectF(129.16508, 175.15228, 6.13332, 54.03779)
-    bar_right = QRectF(180.70160, 246.26339, 6.13332, 54.03779)  # post-flip position
+    bud_left = QPointF(20, 80)
+    bud_right = QPointF(158, 151.11111)
+    bar_left = QRectF(129.16508, 177.15228, 6.13332, 54.03779)
+    bar_right = QRectF(180.70160, 248.26339, 6.13332, 54.03779)  # post-flip position
 
-    buttons = [QRectF(90, 353, 64, 64), QRectF(166, 353, 64, 64)]
+    buttons = [QRectF(90, 352.5, 64, 64), QRectF(166, 352.5, 64, 64)]
+    # Glyph SVG boxes as exported: ANC 64×64, transparency 64×64.5, same origin as the disc.
+    glyph_boxes = {ANC: (64, 64.0), TRANSPARENCY: (64, 64.5)}
     relaunch = QPointF(24, 441)
     minimize = QRectF(266, 16, 16, 16)
     close = QRectF(288, 16, 16, 16)
@@ -126,6 +132,75 @@ def svg(name):
     if name not in _svgs:
         _svgs[name] = QSvgRenderer(os.path.join(UI, name))
     return _svgs[name]
+
+
+def squircle(rect, radius, smoothing):
+    """Rounded rectangle with Figma-style corner smoothing (as in figma-squircle).
+
+    Each corner: a cubic easing into a shortened circular arc and a mirrored cubic
+    out of it, so curvature ramps up instead of jumping like a plain arc.
+    """
+    budget = min(rect.width(), rect.height()) / 2
+    p = min((1 + smoothing) * radius, budget)
+    smoothing = min(smoothing, budget / radius - 1) if radius else 0
+    arc = 90 * (1 - smoothing)
+    arc_len = math.sin(math.radians(arc / 2)) * radius * math.sqrt(2)
+    alpha = (90 - arc) / 2
+    p34 = radius * math.tan(math.radians(alpha / 2))
+    beta = 45 * smoothing
+    c = p34 * math.cos(math.radians(beta))
+    d = c * math.tan(math.radians(beta))
+    b = (p - arc_len - c - d) / 3
+    a = 2 * b
+    k = 4 / 3 * math.tan(math.radians(arc / 4)) * radius  # cubic handle for the arc
+
+    l, t, r, btm = rect.left(), rect.top(), rect.right(), rect.bottom()
+    # (corner, incoming edge direction u, outgoing edge direction v), clockwise from top-right
+    corners = [((r, t), (1, 0), (0, 1)), ((r, btm), (0, 1), (-1, 0)),
+               ((l, btm), (-1, 0), (0, -1)), ((l, t), (0, -1), (1, 0))]
+    path = QPainterPath()
+    for i, (C, u, v) in enumerate(corners):
+        pt = lambda du, dv: QPointF(C[0] + du * u[0] + dv * v[0], C[1] + du * u[1] + dv * v[1])
+        start = pt(-p, 0)
+        if i == 0:
+            path.moveTo(start)
+        else:
+            path.lineTo(start)
+        e1 = pt(-p + a + b + c, d)
+        path.cubicTo(pt(-p + a, 0), pt(-p + a + b, 0), e1)
+        q = pt(-p + a + b + c + arc_len, d + arc_len)
+        center = pt(-radius, radius)
+        t1, t2 = _arc_tangent(e1, center, u, v), _arc_tangent(q, center, u, v)
+        path.cubicTo(e1 + t1 * k, q - t2 * k, q)
+        path.cubicTo(pt(-p + a + b + c + arc_len + d, d + arc_len + c),
+                     pt(-p + a + b + c + arc_len + d, d + arc_len + b + c), pt(0, p))
+    path.closeSubpath()
+    return path
+
+
+def _arc_tangent(point, center, u, v):
+    """Unit travel direction along a corner arc: the radius perpendicular heading u→v."""
+    rx, ry = point.x() - center.x(), point.y() - center.y()
+    n = math.hypot(rx, ry)
+    cand = QPointF(-ry / n, rx / n)
+    if cand.x() * (u[0] + v[0]) + cand.y() * (u[1] + v[1]) < 0:
+        cand = -cand
+    return cand
+
+
+def svg_tinted(name, size, color, dpr):
+    """Render a one-colour SVG glyph in `color` (alpha respected) at device resolution."""
+    w, h = size
+    img = QImage(round(w * dpr), round(h * dpr), QImage.Format_ARGB32_Premultiplied)
+    img.fill(Qt.transparent)
+    p = QPainter(img)
+    p.setRenderHint(QPainter.Antialiasing)
+    svg(name).render(p, QRectF(0, 0, img.width(), img.height()))
+    p.setCompositionMode(QPainter.CompositionMode_SourceIn)
+    p.fillRect(img.rect(), color)
+    p.end()
+    img.setDevicePixelRatio(dpr)
+    return img
 
 
 def bar_path(rect, height, mirror):
@@ -517,10 +592,10 @@ class MainWindow(QWidget):
         card = QRectF(0, 0, Design.width, Design.height)
         p.setPen(Qt.NoPen)
         p.setBrush(Design.bg)
-        p.drawRoundedRect(card, Design.radius, Design.radius)
+        p.drawPath(squircle(card, Design.radius, Design.smoothing))
         p.setPen(QPen(Design.border, 1))
         p.setBrush(Qt.NoBrush)
-        p.drawRoundedRect(card.adjusted(0.5, 0.5, -0.5, -0.5), Design.radius - 0.5, Design.radius - 0.5)
+        p.drawPath(squircle(card.adjusted(0.5, 0.5, -0.5, -0.5), Design.radius - 0.5, Design.smoothing))
 
         # Header.
         p.setPen(Design.title)
@@ -577,11 +652,13 @@ class MainWindow(QWidget):
         p.setOpacity(0.5 + 0.5 * on)
         for i, mode in enumerate(MODE_BUTTONS):
             r = Design.buttons[i]
+            t = self._active[i] * on
             p.setPen(Qt.NoPen)
-            p.setBrush(mix(Design.idle, Design.green, self._active[i] * on))
+            p.setBrush(mix(Design.button_off, Design.button_on, t))
             p.drawEllipse(r)
             glyph = "window-anc.svg" if mode == ANC else "window-transparency.svg"
-            svg(glyph).render(p, QRectF(r.left(), r.top(), 64, 64.5))
+            p.drawImage(r.topLeft(), svg_tinted(glyph, Design.glyph_boxes[mode],
+                                                mix(Design.glyph_off, Design.glyph_on, t), dpr))
         p.setOpacity(1)
 
         p.setPen(Design.subtitle)
