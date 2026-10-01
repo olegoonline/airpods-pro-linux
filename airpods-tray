@@ -1,0 +1,837 @@
+#!/usr/bin/env python3
+"""airpods-tray — tray icon, tray widget and window for AirPods Pro 3 listening modes.
+
+Pixel-for-pixel implementation of the Figma design: window states "Connected",
+"Disconnected" and "Low Battery", the app icon, the tray icon (connected /
+disconnected) and the tray widget. Uses PySide6 (Qt 6), which ships with Bazzite.
+
+The app runs on XWayland: on Wayland a client cannot place its own windows, and
+the tray widget has to open right under the tray icon.
+"""
+
+import os
+import sys
+import threading
+import time
+
+os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+ASSETS = os.path.join(HERE, "assets")
+UI = os.path.join(ASSETS, "ui")
+sys.path.insert(0, HERE)
+from airpods_aap import (CASE, CMD_ALLOW_OFF_MODE, CMD_ONE_BUD_ANC, LEFT, MODE_TITLES, MODES, RIGHT,  # noqa: E402
+                         AirPods, AirPodsError, find_airpods)
+
+from PySide6.QtCore import (Property, QEasingCurve, QObject, QPoint, QPointF,  # noqa: E402
+                            QPropertyAnimation, QRectF, QSocketNotifier, Qt, QTimer,
+                            QVariantAnimation, Signal)
+from PySide6.QtGui import (QColor, QCursor, QFont, QFontDatabase, QFontMetricsF,  # noqa: E402
+                           QGuiApplication, QIcon, QImage, QPainter, QPainterPath, QPen,
+                           QPixmap, QTransform)
+from PySide6.QtNetwork import QLocalServer, QLocalSocket  # noqa: E402
+from PySide6.QtSvg import QSvgRenderer  # noqa: E402
+from PySide6.QtWidgets import QApplication, QMenu, QWidget  # noqa: E402
+
+import media  # noqa: E402
+from sni import TrayItem  # noqa: E402
+
+APP_ID = "airpods-tray"
+RECONNECT_MS = 5000
+OFF, ANC, TRANSPARENCY = MODES["off"], MODES["anc"], MODES["transparency"]
+# Only the two main modes are offered; pressing the active one again turns it off.
+MODE_BUTTONS = [ANC, TRANSPARENCY]
+LOW_BATTERY = 25  # percent; the "Low Battery" frame shows ~25%
+EAR_IN = 0x00     # ear-detection status byte: in ear (0x01 out, 0x02 in case)
+
+
+class Design:
+    """Tokens and geometry from the Figma frames (frame-relative coordinates)."""
+    width, height, radius = 320, 480, 18
+    bg = QColor("#f5f5f5")
+    border = QColor("#ffffff")
+    title = QColor("#333333")
+    subtitle = QColor("#999999")
+    green = QColor("#76cd26")
+    red = QColor("#c7372f")
+    control = QColor("#d4d4d4")
+    control_glyph = QColor("#4d4d4d")
+    idle = QColor("#cccccc")
+    track = QColor("#88898b")
+    offline = QColor("#4c4c4c")
+
+    title_text = "AirPods Pro 3"
+    title_rect = QRectF(16, 16, 250, 25)
+    subtitle_rect = QRectF(16, 45, 250, 15)
+
+    bud_size = (138, 184)
+    bud_left = QPointF(20, 78)
+    bud_right = QPointF(158, 149.11111)
+    bar_left = QRectF(129.16508, 175.15228, 6.13332, 54.03779)
+    bar_right = QRectF(180.70160, 246.26339, 6.13332, 54.03779)  # post-flip position
+
+    buttons = [QRectF(90, 353, 64, 64), QRectF(166, 353, 64, 64)]
+    relaunch = QPointF(24, 441)
+    minimize = QRectF(266, 16, 16, 16)
+    close = QRectF(288, 16, 16, 16)
+
+
+class Widget:
+    """Tray widget (7:748): 90×129, #24272c, radius 25, 1px white/10% inside stroke,
+    padding 8 inside the stroke, 2×3 grid of 33px tiles with 6px gaps."""
+    width, height, radius = 90, 129, 25
+    bg = QColor("#24272c")
+    border = QColor(255, 255, 255, round(0.1 * 255))
+    tile_idle = QColor(255, 255, 255, round(0.25 * 255))
+    track = QColor(255, 255, 255, round(0.25 * 255))
+    gap_below_panel = 4
+    tiles = {
+        "open": QRectF(9, 9, 33, 33), "case": QRectF(48, 9, 33, 33),
+        "left": QRectF(9, 48, 33, 33), "right": QRectF(48, 48, 33, 33),
+        ANC: QRectF(9, 87, 33, 33), TRANSPARENCY: QRectF(48, 87, 33, 33),
+    }
+
+
+def load_fonts():
+    for name in ("Inter-Regular.ttf", "Inter-Bold.ttf"):
+        QFontDatabase.addApplicationFont(os.path.join(ASSETS, name))
+
+
+def inter(px, bold=False):
+    f = QFont("Inter")
+    f.setPixelSize(px)
+    f.setBold(bold)
+    f.setHintingPreference(QFont.PreferNoHinting)
+    return f
+
+
+def mix(a, b, t):
+    return QColor.fromRgbF(a.redF() + (b.redF() - a.redF()) * t,
+                           a.greenF() + (b.greenF() - a.greenF()) * t,
+                           a.blueF() + (b.blueF() - a.blueF()) * t,
+                           a.alphaF() + (b.alphaF() - a.alphaF()) * t)
+
+
+def level_color(level):
+    return Design.red if level is not None and level <= LOW_BATTERY else Design.green
+
+
+_svgs = {}
+
+
+def svg(name):
+    if name not in _svgs:
+        _svgs[name] = QSvgRenderer(os.path.join(UI, name))
+    return _svgs[name]
+
+
+def bar_path(rect, height, mirror):
+    """Slanted battery bar from the Figma SVG ("Rectangle 9/10"), bottom-aligned.
+
+    The SVG path is reproduced exactly; only its height varies with the level.
+    """
+    w, h = 6.13332, height
+    path = QPainterPath(QPointF(0, 1.02242))
+    path.cubicTo(0, 0.399947, 0.551636, -0.0780184, 1.16777, 0.0106087)
+    path.lineTo(5.25664, 0.598772)
+    path.cubicTo(5.75979, 0.671148, w, 1.10225, w, 1.61058)
+    path.lineTo(w, h - 1.02251)
+    path.cubicTo(w, h - 0.40001, 5.58168, h + 0.078, 4.96556, h - 0.0106)
+    path.lineTo(0.876681, h - 0.5988)
+    path.cubicTo(0.373525, h - 0.6712, 0, h - 1.1023, 0, h - 1.6106)
+    path.closeSubpath()
+    # Same 0.29% inset Figma applies to the full-height track.
+    bottom = rect.bottom() - rect.height() * 0.0029
+    if mirror:
+        path = QTransform(-1, 0, 0, 1, w, 0).map(path)
+    path.translate(rect.left(), bottom - h)
+    return path
+
+
+def draw_ring(p, center, radius, width, level, color, track):
+    """Battery ring: faint full track plus an arc from 12 o'clock, clockwise."""
+    box = QRectF(center.x() - radius, center.y() - radius, 2 * radius, 2 * radius)
+    if track is not None:
+        p.setPen(QPen(track, width))
+        p.setBrush(Qt.NoBrush)
+        p.drawEllipse(box)
+    if level and level > 0:
+        p.setPen(QPen(color, width, Qt.SolidLine, Qt.RoundCap))
+        p.drawArc(box, 90 * 16, round(-360 * 16 * min(level, 100) / 100))
+
+
+class Assets:
+    """The earbud photo from the design, box-filtered once per scale."""
+
+    def __init__(self):
+        sprite = QImage(os.path.join(ASSETS, "airpods.png"))
+        # The design shows the left half of the sprite (image width 200%).
+        self.bud = sprite.copy(0, 0, sprite.width() // 2, sprite.height())
+        self._cache = {}
+
+    def bud_pixmap(self, dpr, mirror):
+        key = (dpr, mirror)
+        if key not in self._cache:
+            w, h = (round(v * dpr) for v in Design.bud_size)
+            img = self.bud.mirrored(True, False) if mirror else self.bud
+            pix = QPixmap.fromImage(img.scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
+            pix.setDevicePixelRatio(dpr)
+            self._cache[key] = pix
+        return self._cache[key]
+
+
+# --------------------------------------------------------------------- connection
+
+class Connection(QObject):
+    """Keeps an AAP link open, reconnecting whenever the AirPods come back."""
+
+    changed = Signal()
+    rejected = Signal(int, int)  # requested mode, mode the AirPods kept
+    _opened = Signal(object)
+    _failed = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.pods = None
+        self.error = "Поиск AirPods…"
+        self._notifier = None
+        self._connecting = False
+        self._pending_mode = None
+        self._auto_paused = []  # MPRIS players paused by ear detection
+        self._opened.connect(self._on_opened)
+        self._failed.connect(self._on_failed)
+        self._timer = QTimer(self, interval=RECONNECT_MS, timeout=self.connect_now)
+        self._timer.start()
+        QTimer.singleShot(0, self.connect_now)
+
+    @property
+    def connected(self):
+        return self.pods is not None
+
+    def connect_now(self):
+        if self.connected or self._connecting:
+            return
+        self._connecting = True
+        threading.Thread(target=self._connect_worker, daemon=True).start()
+
+    def _connect_worker(self):
+        try:
+            pods = AirPods(find_airpods()).open()
+        except AirPodsError as e:
+            self._failed.emit(str(e))
+        else:
+            self._opened.emit(pods)
+
+    def _on_opened(self, pods):
+        self._connecting = False
+        self.pods = pods
+        self.error = None
+        pods.sock.setblocking(False)
+        self._notifier = QSocketNotifier(pods.fileno(), QSocketNotifier.Read, self)
+        self._notifier.activated.connect(self._on_readable)
+        # "Off" is reached by un-pressing the active mode, so it must be allowed.
+        self._send("send_control", CMD_ALLOW_OFF_MODE, 0x01)
+        # Keep noise cancellation when one bud is taken out instead of the AirPods
+        # switching themselves to transparency.
+        self._send("send_control", CMD_ONE_BUD_ANC, 0x01)
+        self.changed.emit()
+
+    def _on_failed(self, message):
+        self._connecting = False
+        self.error = message
+        self.changed.emit()
+
+    def drop(self, message):
+        if self._notifier:
+            self._notifier.setEnabled(False)
+            self._notifier.deleteLater()
+            self._notifier = None
+        if self.pods:
+            self.pods.close()
+            self.pods = None
+        self.error = message
+        self.changed.emit()
+
+    def _on_readable(self):
+        ears_before = self.pods.ears
+        try:
+            while True:
+                self.pods.read_packet()
+        except BlockingIOError:
+            pass
+        except AirPodsError as e:
+            self.drop(str(e))
+            return
+        if self._pending_mode is not None and self.pods.mode is not None:
+            if self.pods.mode != self._pending_mode:
+                self.rejected.emit(self._pending_mode, self.pods.mode)
+            self._pending_mode = None
+        if self.pods.ears != ears_before:
+            self._on_ears(ears_before, self.pods.ears)
+        self.changed.emit()
+
+    def _on_ears(self, before, now):
+        """Ear detection: pause when a bud comes out, resume when both are back in."""
+        both_in = lambda e: e is not None and all(x == EAR_IN for x in e)
+        if both_in(before) and not both_in(now):
+            self._auto_paused = media.pause_playing()
+        elif both_in(now) and self._auto_paused:
+            media.resume(self._auto_paused)
+            self._auto_paused = []
+
+    def _send(self, method, *args):
+        if not self.connected:
+            return
+        try:
+            getattr(self.pods, method)(*args)
+        except OSError as e:
+            self.drop(f"Соединение потеряно: {e}")
+
+    def set_mode(self, mode):
+        self._pending_mode = mode
+        self._send("send_mode", mode)
+
+    def press_mode(self, mode):
+        """Button semantics: pressing the active mode again switches to Off."""
+        if self.connected:
+            self.set_mode(OFF if self.pods.mode == mode else mode)
+
+    def cycle(self):
+        """Middle click on the tray icon: noise cancellation ↔ transparency."""
+        if self.connected:
+            self.set_mode(TRANSPARENCY if self.pods.mode == ANC else ANC)
+
+    def level(self, part):
+        return self.pods.battery_level(part) if self.pods else None
+
+    @property
+    def worn(self):
+        return bool(self.pods and self.pods.ears and 0x00 in self.pods.ears)
+
+
+# ------------------------------------------------------------------------- window
+
+class MainWindow(QWidget):
+    """Frameless 320×480 card from the Figma design."""
+
+    def __init__(self, conn, assets):
+        super().__init__()
+        self.conn = conn
+        self.assets = assets
+        self.setWindowTitle("AirPods")
+        self.setWindowIcon(app_icon())
+        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)  # only for the rounded corners
+        self.setFixedSize(Design.width, Design.height)
+        self.setMouseTracking(True)
+
+        self._appear = 1.0                       # earbuds rise in when the window opens
+        self._online = 1.0 if conn.connected else 0.0
+        self._levels = {LEFT: 0.0, RIGHT: 0.0}   # displayed (animated) battery levels
+        self._known = {LEFT: None, RIGHT: None}  # last reported, kept when disconnected
+        self._active = [0.0] * len(MODE_BUTTONS)
+        self._anims = []
+
+        self._appear_anim = QPropertyAnimation(self, b"appear", self)
+        self._appear_anim.setDuration(1400)
+        self._appear_anim.setEasingCurve(QEasingCurve.Linear)  # per-bud easing in paint
+        self._online_anim = QPropertyAnimation(self, b"online", self)
+        self._online_anim.setDuration(450)
+        self._online_anim.setEasingCurve(QEasingCurve.InOutCubic)
+
+        conn.changed.connect(self.refresh)
+        self.refresh(animate=False)
+
+    def _get_appear(self):
+        return self._appear
+
+    def _set_appear(self, v):
+        self._appear = v
+        self.update()
+
+    appear = Property(float, _get_appear, _set_appear)
+
+    def _get_online(self):
+        return self._online
+
+    def _set_online(self, v):
+        self._online = v
+        self.update()
+
+    online = Property(float, _get_online, _set_online)
+
+    def _animate(self, start, end, setter, duration, curve=QEasingCurve.OutCubic):
+        anim = QVariantAnimation(self)
+        anim.setStartValue(float(start))
+        anim.setEndValue(float(end))
+        anim.setDuration(duration)
+        anim.setEasingCurve(curve)
+        anim.valueChanged.connect(lambda v: (setter(v), self.update()))
+        anim.finished.connect(lambda: self._anims.remove(anim))
+        self._anims.append(anim)
+        anim.start()
+
+    # ------------------------------------------------------------------ state
+
+    def refresh(self, animate=True):
+        pods = self.conn.pods
+        online = 1.0 if pods else 0.0
+        for part in (LEFT, RIGHT):
+            level = self.conn.level(part)
+            if level is not None:
+                self._known[part] = level
+        states = [1.0 if pods and pods.mode == m else 0.0 for m in MODE_BUTTONS]
+
+        if not animate:
+            self._online, self._active = online, states
+            self._levels = {p: float(self._known[p] or 0) for p in (LEFT, RIGHT)}
+            self.update()
+            return
+        if self._online_anim.endValue() != online or (
+                self._online_anim.state() != QPropertyAnimation.Running and self._online != online):
+            self._online_anim.stop()
+            self._online_anim.setStartValue(self._online)
+            self._online_anim.setEndValue(online)
+            self._online_anim.start()
+        for i, target in enumerate(states):
+            if self._active[i] != target:
+                self._animate(self._active[i], target, lambda v, i=i: self._active.__setitem__(i, v), 220)
+        for part in (LEFT, RIGHT):
+            target = float(self._known[part] or 0)
+            if abs(self._levels[part] - target) > 0.01:
+                self._animate(self._levels[part], target,
+                              lambda v, part=part: self._levels.__setitem__(part, v), 700)
+
+    def show_raised(self):
+        if not self.isVisible():
+            # Earbuds rise from below (left first) while their batteries fill up.
+            self._appear_anim.stop()
+            self._appear = 0.0
+            self._appear_anim.setStartValue(0.0)
+            self._appear_anim.setEndValue(1.0)
+            QTimer.singleShot(60, self._appear_anim.start)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def toggle(self):
+        if self.isVisible() and self.isActiveWindow():
+            self.hide()
+        else:
+            self.show_raised()
+
+    # ------------------------------------------------------------------ input
+
+    def relaunch_rect(self):
+        m = QFontMetricsF(inter(12))
+        return QRectF(Design.relaunch.x(), Design.relaunch.y(), m.horizontalAdvance("Relaunch"), m.height())
+
+    def hit(self, pos):
+        for i, r in enumerate(Design.buttons):
+            d = pos - r.center()
+            if d.x() ** 2 + d.y() ** 2 <= (r.width() / 2) ** 2:
+                return ("button", i)
+        for name, rect in (("relaunch", self.relaunch_rect()), ("minimize", Design.minimize),
+                           ("close", Design.close)):
+            if rect.contains(pos):
+                return (name, None)
+        return (None, None)
+
+    def mouseMoveEvent(self, e):
+        kind, i = self.hit(e.position())
+        clickable = kind in ("relaunch", "minimize", "close") or (kind == "button" and self.conn.connected)
+        self.setCursor(Qt.PointingHandCursor if clickable else Qt.ArrowCursor)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton and self.hit(e.position())[0] is None and self.windowHandle():
+            self.windowHandle().startSystemMove()  # drag the card by its background
+
+    def mouseReleaseEvent(self, e):
+        if e.button() != Qt.LeftButton:
+            return
+        kind, i = self.hit(e.position())
+        if kind == "relaunch":
+            relaunch()
+        elif kind == "minimize":
+            self.showMinimized()
+        elif kind == "close":
+            self.hide()
+        elif kind == "button":
+            self.conn.press_mode(MODE_BUTTONS[i])
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape:
+            self.hide()
+
+    def closeEvent(self, event):
+        # Closing the window keeps the app running in the tray.
+        event.ignore()
+        self.hide()
+
+    # ------------------------------------------------------------------ painting
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform |
+                         QPainter.TextAntialiasing)
+        dpr = self.devicePixelRatioF()
+        on = self._online
+
+        # Card with the 1px white inside stroke.
+        card = QRectF(0, 0, Design.width, Design.height)
+        p.setPen(Qt.NoPen)
+        p.setBrush(Design.bg)
+        p.drawRoundedRect(card, Design.radius, Design.radius)
+        p.setPen(QPen(Design.border, 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(card.adjusted(0.5, 0.5, -0.5, -0.5), Design.radius - 0.5, Design.radius - 0.5)
+
+        # Header.
+        p.setPen(Design.title)
+        p.setFont(inter(21, bold=True))
+        p.drawText(Design.title_rect, Qt.AlignLeft | Qt.AlignVCenter, Design.title_text)
+        p.setPen(Design.subtitle)
+        p.setFont(inter(12))
+        p.drawText(Design.subtitle_rect, Qt.AlignLeft | Qt.AlignVCenter, self._subtitle())
+
+        for r in (Design.minimize, Design.close):
+            p.setPen(Qt.NoPen)
+            p.setBrush(Design.control)
+            p.drawEllipse(r)
+        p.setPen(QPen(Design.control_glyph, 1, Qt.SolidLine, Qt.RoundCap))
+        m = Design.minimize
+        # Half-pixel offset keeps the 1px dash on the pixel grid, as Figma renders it.
+        p.drawLine(QPointF(m.left() + 4.5, m.top() + 8.5), QPointF(m.left() + 11.5, m.top() + 8.5))
+        p.setPen(QPen(Design.control_glyph, 1.25, Qt.SolidLine, Qt.RoundCap))
+        c = Design.close
+        p.drawLine(QPointF(c.left() + 5, c.top() + 5), QPointF(c.left() + 11, c.top() + 11))
+        p.drawLine(QPointF(c.left() + 11, c.top() + 5), QPointF(c.left() + 5, c.top() + 11))
+
+        # Earbuds rise straight up from below, the left one first. Each battery bar fills
+        # on the same curve and timing as its earbud, so both start and settle together.
+        rise = QEasingCurve(QEasingCurve.OutQuart)
+        for idx, (mirror, origin, bar, part) in enumerate((
+                (False, Design.bud_left, Design.bar_left, LEFT),
+                (True, Design.bud_right, Design.bar_right, RIGHT))):
+            t = max(0.0, min(1.0, (self._appear - idx * 0.12) / 0.88))
+            k = rise.valueForProgress(t)
+            f = k
+            fade = QEasingCurve(QEasingCurve.OutCubic).valueForProgress(min(1.0, t / 0.5))
+            p.save()
+            p.translate(0, (1 - k) * 40)
+            p.setOpacity((0.5 + 0.5 * on) * fade)
+            p.drawPixmap(origin, self.assets.bud_pixmap(dpr, mirror))
+            track = bar_path(bar, 53.7231, mirror)
+            level = self._levels[part] * f
+            charge = None
+            if level > 0.5:
+                charge = bar_path(bar, max(2.2, 53.7231 * min(level, 100) / 100), mirror)
+                # Figma composites the fill straight onto the earbud, not over the track,
+                # which shows when both are 50% transparent (Disconnected).
+                track = track.subtracted(charge)
+            p.setPen(Qt.NoPen)
+            p.setBrush(Design.track)
+            p.drawPath(track)
+            if charge is not None:
+                p.setBrush(mix(Design.offline, level_color(self._levels[part]), on))
+                p.drawPath(charge)
+            p.restore()
+
+        # Mode buttons.
+        p.setOpacity(0.5 + 0.5 * on)
+        for i, mode in enumerate(MODE_BUTTONS):
+            r = Design.buttons[i]
+            p.setPen(Qt.NoPen)
+            p.setBrush(mix(Design.idle, Design.green, self._active[i] * on))
+            p.drawEllipse(r)
+            glyph = "window-anc.svg" if mode == ANC else "window-transparency.svg"
+            svg(glyph).render(p, QRectF(r.left(), r.top(), 64, 64.5))
+        p.setOpacity(1)
+
+        p.setPen(Design.subtitle)
+        p.setFont(inter(12))
+        p.drawText(self.relaunch_rect(), Qt.AlignLeft | Qt.AlignVCenter, "Relaunch")
+
+    def _subtitle(self):
+        if not self.conn.connected:
+            return "Disconnected"
+        level = self.conn.level(CASE)
+        return f"Case Battery: {level}%" if level is not None else "Connected"
+
+
+def relaunch():
+    """Restart the whole program (re-reads files, resets the Bluetooth link)."""
+    server = QApplication.instance().property("instance_server")
+    if server:
+        server.close()
+    os.execv(sys.executable, [sys.executable, os.path.realpath(__file__), *sys.argv[1:]])
+
+
+# --------------------------------------------------------------------- tray widget
+
+class TrayWidget(QWidget):
+    """Popup under the tray icon: open app, battery rings, the two mode buttons."""
+
+    open_app = Signal()
+
+    LEAVE_MS = 700      # pointer left the widget: close after this pause
+    UNVISITED_MS = 6000  # opened but never hovered: close after this
+
+    def __init__(self, conn):
+        # Not Qt.Popup and no activation tricks: under XWayland KWin's focus-stealing
+        # prevention takes activation away at random, and a popup then closes on the
+        # first click inside. The widget instead behaves like a hover card: clicks inside
+        # never close it; it closes once the pointer has left it, on the tray icon, or
+        # with the "open" button.
+        super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint |
+                         Qt.WindowDoesNotAcceptFocus | Qt.NoDropShadowWindowHint)
+        self.conn = conn
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setFixedSize(Widget.width, Widget.height)
+        self.setMouseTracking(True)
+        self._hidden_at = 0.0
+        self._close_timer = QTimer(self, singleShot=True, timeout=self.hide)
+        conn.changed.connect(self.update)
+
+    def recently_hidden(self):
+        """True right after a click outside closed it, e.g. a click on the tray icon itself."""
+        return time.monotonic() - self._hidden_at < 0.4
+
+    def enterEvent(self, e):
+        self._close_timer.stop()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self._close_timer.start(self.LEAVE_MS)
+        super().leaveEvent(e)
+
+    def hideEvent(self, e):
+        self._hidden_at = time.monotonic()
+        self._close_timer.stop()
+        super().hideEvent(e)
+
+    def popup_at(self, x, y):
+        """Centre under the click, 4px below the panel (or above a bottom panel)."""
+        screen = QGuiApplication.screenAt(QPoint(x, max(y, 0))) or QGuiApplication.primaryScreen()
+        full, avail = screen.geometry(), screen.availableGeometry()
+        left = min(max(x - Widget.width // 2, avail.left() + 4), avail.right() - Widget.width - 4)
+        if avail.bottom() < full.bottom() and avail.top() == full.top():
+            top = avail.bottom() - Widget.gap_below_panel - Widget.height
+        else:
+            top = avail.top() + Widget.gap_below_panel
+        self.move(left, top)
+        self.show()
+        self.raise_()
+        # QCursor.pos() is stale under XWayland, so always arm; hovering stops it.
+        self._close_timer.start(self.UNVISITED_MS)
+
+    def tile_at(self, pos):
+        for key, r in Widget.tiles.items():
+            if r.contains(pos):
+                return key
+        return None
+
+    def mouseMoveEvent(self, e):
+        self._close_timer.stop()
+        key = self.tile_at(e.position())
+        clickable = key == "open" or (key in MODE_BUTTONS and self.conn.connected)
+        self.setCursor(Qt.PointingHandCursor if clickable else Qt.ArrowCursor)
+
+    def mouseReleaseEvent(self, e):
+        key = self.tile_at(e.position())
+        if key == "open":
+            self.hide()
+            self.open_app.emit()
+        elif key in MODE_BUTTONS:
+            self.conn.press_mode(key)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        connected = self.conn.connected
+        pods = self.conn.pods
+
+        card = QRectF(0, 0, Widget.width, Widget.height)
+        p.setPen(Qt.NoPen)
+        p.setBrush(Widget.bg)
+        p.drawRoundedRect(card, Widget.radius, Widget.radius)
+        p.setPen(QPen(Widget.border, 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(card.adjusted(0.5, 0.5, -0.5, -0.5), Widget.radius - 0.5, Widget.radius - 0.5)
+
+        svg("widget-open.svg").render(p, Widget.tiles["open"])
+
+        # Battery tiles. Disconnected (7:756…): tile at 50%, glyph group another 50%, no arc.
+        for key, part, glyph in (("case", CASE, "widget-case.svg"), ("left", LEFT, "widget-left.svg"),
+                                 ("right", RIGHT, "widget-right.svg")):
+            r = Widget.tiles[key]
+            level = self.conn.level(part)
+            p.setOpacity(1.0 if connected else 0.5)
+            draw_ring(p, r.center(), 15, 3, level if connected else None,
+                      level_color(level), Widget.track)
+            p.setOpacity(1.0 if connected else 0.25)
+            svg(glyph).render(p, r)
+        p.setOpacity(1.0)
+
+        # Mode buttons.
+        for mode in MODE_BUTTONS:
+            r = Widget.tiles[mode]
+            active = connected and pods.mode == mode
+            # Disconnected (7:768): tile at 50%, glyph another 50%.
+            p.setOpacity(1.0 if connected else 0.5)
+            p.setPen(Qt.NoPen)
+            p.setBrush(Design.green if active else Widget.tile_idle)
+            p.drawEllipse(r)
+            p.setOpacity(1.0 if connected else 0.25)
+            glyph = "widget-anc.svg" if mode == ANC else "widget-transparency.svg"
+            svg(glyph).render(p, QRectF(r.left(), r.top(), 33, 33.2578))
+        p.setOpacity(1.0)
+
+
+# --------------------------------------------------------------------------- icons
+
+def app_icon_image(size):
+    """Figma "App Icon" (2:145): white 256px tile, radius 64, 201.72×130 glyph centred."""
+    img = QImage(size, size, QImage.Format_ARGB32_Premultiplied)
+    img.fill(Qt.transparent)
+    p = QPainter(img)
+    p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+    p.scale(size / 256, size / 256)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor("#ffffff"))
+    p.drawRoundedRect(QRectF(0, 0, 256, 256), 64, 64)
+    w, h = 201.72, 130.0
+    svg("app-glyph.svg").render(p, QRectF(128 - 0.07 - w / 2, 128 - h / 2, w, h))
+    p.end()
+    return img
+
+
+def app_icon():
+    icon = QIcon()
+    for size in (16, 22, 24, 32, 48, 64, 128, 256, 512):
+        icon.addPixmap(QPixmap.fromImage(app_icon_image(size)))
+    return icon
+
+
+TRAY_SIZES = (16, 18, 22, 24, 32, 36, 44, 48, 64)
+
+
+def tray_icon_image(size, level, connected):
+    """Figma "Tray" (2:149), 18px: grey ring, battery arc from 12 o'clock, white glyph.
+    Disconnected (7:726): ring only, glyph at 50%."""
+    img = QImage(size, size, QImage.Format_ARGB32_Premultiplied)
+    img.fill(Qt.transparent)
+    p = QPainter(img)
+    p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+    p.scale(size / 18, size / 18)
+    draw_ring(p, QPointF(9, 9), 8.25, 1.5, level if connected else None, level_color(level),
+              QColor("#636363"))
+    p.setOpacity(1.0 if connected else 0.5)
+    w, h = 13.0001, 8.37795
+    svg("tray-glyph.svg").render(p, QRectF(9 - w / 2, 9 - h / 2, w, h))
+    p.end()
+    return img
+
+
+# --------------------------------------------------------------------------- tray
+
+class Tray(QObject):
+    """Tray icon (own StatusNotifierItem) + tray widget + context menu."""
+
+    def __init__(self, conn, window):
+        super().__init__()
+        self.conn = conn
+        self.window = window
+        self.widget = TrayWidget(conn)
+        self.widget.open_app.connect(window.show_raised)
+        self.item = TrayItem(APP_ID, "AirPods")
+        self.item.activated.connect(self.on_click)
+        self.item.secondary.connect(lambda x, y: conn.cycle())
+        self.item.context.connect(self.on_menu)
+        conn.changed.connect(self.refresh)
+        self._last_icon = None
+        self.refresh()
+
+    def on_click(self, x, y):
+        if self.widget.isVisible():
+            self.widget.hide()
+        elif not self.widget.recently_hidden():  # that click on the icon just closed it
+            self.widget.popup_at(x, y)
+
+    def on_menu(self, x, y):
+        menu = QMenu()
+        menu.addAction("Открыть окно", self.window.show_raised)
+        menu.addSeparator()
+        pods = self.conn.pods
+        for mode in (ANC, TRANSPARENCY, OFF):
+            act = menu.addAction(MODE_TITLES[mode], lambda m=mode: self.conn.set_mode(m))
+            act.setCheckable(True)
+            act.setChecked(bool(pods and pods.mode == mode))
+            act.setEnabled(pods is not None)
+        menu.addSeparator()
+        menu.addAction("Перезапустить", relaunch)
+        menu.addAction("Выход", QApplication.quit)
+        menu.exec(QPoint(x, y) if (x or y) else QCursor.pos())
+
+    def refresh(self):
+        pods = self.conn.pods
+        connected = pods is not None
+        levels = [v for v in (self.conn.level(LEFT), self.conn.level(RIGHT)) if v is not None]
+        level = min(levels) if levels else None
+        key = (connected, level)
+        if key != self._last_icon:
+            self._last_icon = key
+            self.item.set_icon([tray_icon_image(s, level, connected) for s in TRAY_SIZES])
+        if connected:
+            body = f"{MODE_TITLES.get(pods.mode, '…')}\n{pods.battery_text()}"
+        else:
+            body = f"Не подключено\n{self.conn.error or ''}"
+        self.item.set_tooltip(Design.title_text, body)
+
+
+def write_icons(root):
+    """Export the app icon into an XDG hicolor theme tree (used by install.sh)."""
+    for size in (16, 22, 24, 32, 48, 64, 128, 256, 512):
+        d = os.path.join(root, f"{size}x{size}", "apps")
+        os.makedirs(d, exist_ok=True)
+        app_icon_image(size).save(os.path.join(d, f"{APP_ID}.png"))
+
+
+def main():
+    if "--write-icons" in sys.argv:
+        from PySide6.QtGui import QGuiApplication as _App
+        _app = _App(sys.argv[:1])  # noqa: F841 — image painting needs a Qt app
+        write_icons(sys.argv[sys.argv.index("--write-icons") + 1])
+        return 0
+    app = QApplication(sys.argv)
+    app.setApplicationName("AirPods")
+    app.setDesktopFileName(APP_ID)
+    app.setQuitOnLastWindowClosed(False)
+    app.setWindowIcon(app_icon())
+
+    # Single instance: a second launch just shows the existing window.
+    probe = QLocalSocket()
+    probe.connectToServer(APP_ID)
+    if probe.waitForConnected(300):
+        probe.write(b"show")
+        probe.waitForBytesWritten(300)
+        return 0
+    QLocalServer.removeServer(APP_ID)
+    server = QLocalServer()
+    server.listen(APP_ID)
+    app.setProperty("instance_server", server)
+
+    load_fonts()
+    conn = Connection()
+    window = MainWindow(conn, Assets())
+    tray = Tray(conn, window)  # noqa: F841 — keeps the tray icon alive
+    server.newConnection.connect(lambda: (server.nextPendingConnection(), window.show_raised()))
+
+    if "--hidden" not in sys.argv:
+        window.show_raised()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,29 @@
+[Desktop Entry]
+Type=Application
+Name=AirPods
+GenericName=AirPods Control
+GenericName[ru]=Управление AirPods
+Comment=Switch AirPods Pro noise control mode
+Comment[ru]=Шумоподавление, прозрачность и батарея AirPods Pro
+Icon=airpods-tray
+Exec=airpods-tray
+Terminal=false
+StartupWMClass=airpods-tray
+Categories=AudioVideo;Audio;
+Keywords=airpods;anc;noise;transparency;headphones;bluetooth;
+Actions=cycle;anc;transparency;
+
+[Desktop Action cycle]
+Name=Next mode
+Name[ru]=Следующий режим
+Exec=airpods-mode --notify cycle
+
+[Desktop Action anc]
+Name=Noise Cancellation
+Name[ru]=Шумоподавление
+Exec=airpods-mode --notify anc
+
+[Desktop Action transparency]
+Name=Transparency
+Name[ru]=Прозрачность
+Exec=airpods-mode --notify transparency

@@ -1,0 +1,23 @@
+# airpods-pro-linux
+
+> Tray app and CLI to control Apple AirPods Pro 3 on Linux (Bazzite, Fedora, KDE Plasma): switch Active Noise Cancellation and Transparency mode, show left/right/case battery, pause media when an AirPod is taken out. Python + PySide6, installs into ~/.local without root.
+
+Key facts:
+- Only two listening modes are exposed: Noise Cancellation and Transparency. Pressing the active mode again turns noise control off. Adaptive Audio and Conversational Awareness are intentionally not exposed. Spatial audio is never enabled (no head tracking is requested, no PipeWire spatial filter).
+- The graphical interface (window, tray icon, tray widget) is designed for AirPods Pro only; tested on AirPods Pro 3.
+- Ear detection: taking one AirPod out while both were in pauses playing MPRIS players; putting both back resumes only the players the app paused. With one AirPod in, noise cancellation stays on (the app enables the AirPods "Noise Cancellation with One AirPod" setting, control 0x1B = 0x01).
+- Protocol: Apple Accessory Protocol (AAP) over Bluetooth L2CAP PSM 0x1001. Listening mode command: 04 00 04 00 09 00 0D <mode> 00 00 00 (1 off, 2 noise cancellation, 3 transparency). Protocol knowledge from LibrePods (https://github.com/kavishdevar/librepods); this is an independent implementation.
+- On Wayland the app runs via XWayland so the tray widget can be positioned under the KDE tray icon; the tray icon is a custom StatusNotifierItem that receives click coordinates.
+
+## Docs
+
+- [README](https://github.com/olegoonline/airpods-pro-linux/blob/main/README.md): features, install, usage, FAQ (English and Russian)
+
+## Code
+
+- [airpods_aap.py](https://github.com/olegoonline/airpods-pro-linux/blob/main/airpods_aap.py): AAP protocol client (standard library only)
+- [airpods-tray](https://github.com/olegoonline/airpods-pro-linux/blob/main/airpods-tray): window, tray widget, tray icon
+- [sni.py](https://github.com/olegoonline/airpods-pro-linux/blob/main/sni.py): KDE StatusNotifierItem implementation
+- [media.py](https://github.com/olegoonline/airpods-pro-linux/blob/main/media.py): MPRIS pause/resume
+- [airpods-mode](https://github.com/olegoonline/airpods-pro-linux/blob/main/airpods-mode): command-line tool
+- [install.sh](https://github.com/olegoonline/airpods-pro-linux/blob/main/install.sh): installer (~/.local, autostart, icons)
