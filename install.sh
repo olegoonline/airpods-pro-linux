@@ -15,7 +15,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     rm -rf "$share" "$bin/airpods-mode" "$bin/airpods-tray" \
            "$apps/airpods-tray.desktop" "$apps/airpods-mode.desktop" "$autostart"
     update-desktop-database "$apps" 2>/dev/null || true
-    echo "Удалено."
+    echo "Removed."
     exit 0
 fi
 
@@ -46,4 +46,4 @@ if [[ "${1:-}" != "--no-autostart" ]]; then
     sed "s|^Exec=$bin/airpods-tray$|Exec=$bin/airpods-tray --hidden|" "$apps/airpods-tray.desktop" > "$autostart"
 fi
 
-echo "Установлено: airpods-tray (меню «AirPods»), airpods-mode (CLI)"
+echo "Installed: airpods-tray (\"AirPods\" in the app menu), airpods-mode (CLI)"

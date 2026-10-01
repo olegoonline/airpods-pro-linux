@@ -209,7 +209,7 @@ class Connection(QObject):
     def __init__(self):
         super().__init__()
         self.pods = None
-        self.error = "Поиск AirPods…"
+        self.error = "Looking for AirPods…"
         self._notifier = None
         self._connecting = False
         self._pending_mode = None
@@ -303,7 +303,7 @@ class Connection(QObject):
         try:
             getattr(self.pods, method)(*args)
         except OSError as e:
-            self.drop(f"Соединение потеряно: {e}")
+            self.drop(f"Connection lost: {e}")
 
     def set_mode(self, mode):
         self._pending_mode = mode
@@ -797,7 +797,7 @@ class Tray(QObject):
 
     def on_menu(self, x, y):
         menu = QMenu()
-        menu.addAction("Открыть окно", self.window.show_raised)
+        menu.addAction("Open AirPods", self.window.show_raised)
         menu.addSeparator()
         pods = self.conn.pods
         for mode in (ANC, TRANSPARENCY, OFF):
@@ -806,8 +806,8 @@ class Tray(QObject):
             act.setChecked(bool(pods and pods.mode == mode))
             act.setEnabled(pods is not None)
         menu.addSeparator()
-        menu.addAction("Перезапустить", relaunch)
-        menu.addAction("Выход", QApplication.quit)
+        menu.addAction("Relaunch", relaunch)
+        menu.addAction("Quit", QApplication.quit)
         menu.exec(QPoint(x, y) if (x or y) else QCursor.pos())
 
     def refresh(self):

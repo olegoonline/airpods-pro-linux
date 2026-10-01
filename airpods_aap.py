@@ -36,17 +36,17 @@ MODE_ALIASES = {
     "a": "adaptive", "adapt": "adaptive",
 }
 MODE_TITLES = {
-    1: "Выкл.",
-    2: "Шумоподавление",
-    3: "Прозрачность",
-    4: "Адаптивный",
+    1: "Off",
+    2: "Noise Cancellation",
+    3: "Transparency",
+    4: "Adaptive",
 }
 DEFAULT_CYCLE = ["anc", "transparency"]
 
 LEFT, RIGHT, CASE = 0x04, 0x02, 0x08
-BATTERY_PARTS = {LEFT: "Левый", RIGHT: "Правый", CASE: "Кейс"}
+BATTERY_PARTS = {LEFT: "Left", RIGHT: "Right", CASE: "Case"}
 BATTERY_CHARGING, BATTERY_DISCONNECTED = 0x01, 0x04
-EAR_STATUS = {0x00: "в ухе", 0x01: "не в ухе", 0x02: "в кейсе"}
+EAR_STATUS = {0x00: "in ear", 0x01: "out of ear", 0x02: "in case"}
 
 
 class AirPodsError(Exception):
@@ -67,8 +67,8 @@ def find_airpods():
             if f"Modalias: bluetooth:v{APPLE_VENDOR}" in info and "Audio Sink" in info:
                 return mac
     except (OSError, subprocess.TimeoutExpired) as e:
-        raise AirPodsError(f"bluetoothctl недоступен: {e}")
-    raise AirPodsError("Подключённые AirPods не найдены")
+        raise AirPodsError(f"bluetoothctl is unavailable: {e}")
+    raise AirPodsError("No connected AirPods found")
 
 
 class AirPods:
@@ -95,7 +95,7 @@ class AirPods:
                 time.sleep(0.05)
         except OSError as e:
             self.sock.close()
-            raise AirPodsError(f"Не удалось подключиться к {self.mac}: {e}")
+            raise AirPodsError(f"Could not connect to {self.mac}: {e}")
         return self
 
     def close(self):
@@ -137,9 +137,9 @@ class AirPods:
         except BlockingIOError:
             raise  # non-blocking socket drained; caller decides
         except OSError as e:
-            raise AirPodsError(f"Соединение потеряно: {e}")
+            raise AirPodsError(f"Connection lost: {e}")
         if not data:
-            raise AirPodsError("Соединение закрыто")
+            raise AirPodsError("Connection closed")
         self.parse(data)
         return data
 
@@ -188,11 +188,11 @@ class AirPods:
             if level is not None:
                 charging = self.battery[part][1] == BATTERY_CHARGING
                 parts.append(f"{BATTERY_PARTS[part]} {level}%" + (" ⚡" if charging else ""))
-        return ", ".join(parts) or "нет данных"
+        return ", ".join(parts) or "unknown"
 
 
 def resolve_mode(name):
     name = MODE_ALIASES.get(name.lower(), name.lower())
     if name not in MODES:
-        raise AirPodsError(f"Неизвестный режим: {name}")
+        raise AirPodsError(f"Unknown mode: {name}")
     return MODES[name]

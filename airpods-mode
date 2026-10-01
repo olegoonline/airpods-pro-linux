@@ -21,13 +21,13 @@ def notify(title, body=""):
 
 def cmd_status(pods, args):
     pods.sync()
-    print(f"Устройство:  {pods.name or ''} {pods.mac}")
-    print(f"Режим:       {MODE_TITLES.get(pods.mode, pods.mode)}")
+    print(f"Device:   {pods.name or ''} {pods.mac}")
+    print(f"Mode:     {MODE_TITLES.get(pods.mode, pods.mode)}")
     if pods.ca is not None:
-        print(f"Адапт. к разговору: {'вкл.' if pods.ca else 'выкл.'}")
-    print(f"Батарея:     {pods.battery_text()}")
+        print(f"Conversation awareness: {'on' if pods.ca else 'off'}")
+    print(f"Battery:  {pods.battery_text()}")
     if pods.ears:
-        print(f"Наушники:    {', '.join(EAR_STATUS.get(e, '?') for e in pods.ears)}")
+        print(f"Earbuds:  {', '.join(EAR_STATUS.get(e, '?') for e in pods.ears)}")
     if args.notify:
         notify(MODE_TITLES.get(pods.mode, "AirPods"), pods.battery_text())
 
@@ -36,12 +36,12 @@ def apply_mode(pods, mode, args):
     result = pods.set_mode(mode)
     title = MODE_TITLES.get(result, str(result))
     if result != mode:
-        msg = (f"AirPods ответили режимом «{title}» вместо «{MODE_TITLES[mode]}». "
-               "Режим «Выкл.» нужно разрешить в настройках наушников.")
+        msg = (f"AirPods kept \"{title}\" instead of \"{MODE_TITLES[mode]}\" "
+               "(they only change modes while worn; \"Off\" must be allowed).")
         if args.notify:
             notify("AirPods", msg)
         raise AirPodsError(msg)
-    print(f"Режим: {title}")
+    print(f"Mode: {title}")
     if args.notify:
         notify(title, pods.battery_text())
 
@@ -61,34 +61,34 @@ def cmd_ca(pods, args):
     pods.sync()
     want = {"on": True, "off": False, "toggle": not pods.ca}[args.state]
     result = pods.set_ca(want)
-    text = "вкл." if result else "выкл."
-    print(f"Адаптация к разговору: {text}")
+    text = "on" if result else "off"
+    print(f"Conversation awareness: {text}")
     if args.notify:
-        notify("Адаптация к разговору", text)
+        notify("Conversation awareness", text)
 
 
 def main():
     parser = argparse.ArgumentParser(
         prog="airpods-mode",
-        description="Переключение режимов AirPods Pro 3 (протокол AAP из LibrePods). "
-                    "Графический интерфейс: airpods-tray.")
-    parser.add_argument("-d", "--device", help="MAC-адрес AirPods (по умолчанию — автопоиск)")
+        description="Switch AirPods Pro 3 listening modes over Apple's AAP protocol. "
+                    "Graphical app: airpods-tray.")
+    parser.add_argument("-d", "--device", help="AirPods MAC address (default: auto-detect)")
     parser.add_argument("-n", "--notify", action="store_true",
-                        help="показывать уведомление рабочего стола")
+                        help="show a desktop notification")
     sub = parser.add_subparsers(dest="command")
 
-    sub.add_parser("status", help="текущий режим и батарея").set_defaults(func=cmd_status)
+    sub.add_parser("status", help="current mode and battery").set_defaults(func=cmd_status)
     for name in MODES:
-        sub.add_parser(name, help=f"режим «{MODE_TITLES[MODES[name]]}»").set_defaults(
+        sub.add_parser(name, help=f"{MODE_TITLES[MODES[name]]} mode").set_defaults(
             func=cmd_set, mode=name)
-    p = sub.add_parser("set", help="установить режим по имени")
+    p = sub.add_parser("set", help="set a mode by name")
     p.add_argument("mode")
     p.set_defaults(func=cmd_set)
-    p = sub.add_parser("cycle", help="следующий режим по кругу")
+    p = sub.add_parser("cycle", help="switch to the next mode")
     p.add_argument("modes", nargs="*",
-                   help=f"порядок режимов (по умолчанию: {' '.join(DEFAULT_CYCLE)})")
+                   help=f"mode order (default: {' '.join(DEFAULT_CYCLE)})")
     p.set_defaults(func=cmd_cycle)
-    p = sub.add_parser("ca", help="адаптация к разговору")
+    p = sub.add_parser("ca", help="conversation awareness")
     p.add_argument("state", choices=["on", "off", "toggle"])
     p.set_defaults(func=cmd_ca)
 
@@ -101,8 +101,8 @@ def main():
         with AirPods(mac) as pods:
             args.func(pods, args)
     except AirPodsError as e:
-        print(f"Ошибка: {e}", file=sys.stderr)
-        if args.notify and "ответили" not in str(e):
+        print(f"Error: {e}", file=sys.stderr)
+        if args.notify and "kept" not in str(e):
             notify("AirPods", str(e))
         return 1
     return 0
