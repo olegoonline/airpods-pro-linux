@@ -53,22 +53,47 @@ class AirPodsError(Exception):
     pass
 
 
+def _apple_audio_devices(which):
+    """MACs of Apple audio devices from `bluetoothctl devices <which>`."""
+    try:
+        out = subprocess.run(["bluetoothctl", "devices", which],
+                             capture_output=True, text=True, timeout=5).stdout
+        macs = []
+        for mac in re.findall(r"Device ((?:[0-9A-F]{2}:){5}[0-9A-F]{2})", out):
+            info = subprocess.run(["bluetoothctl", "info", mac],
+                                  capture_output=True, text=True, timeout=5).stdout
+            if f"Modalias: bluetooth:v{APPLE_VENDOR}" in info and "Audio Sink" in info:
+                macs.append(mac)
+        return macs
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise AirPodsError(f"bluetoothctl is unavailable: {e}")
+
+
 def find_airpods():
     """Return the MAC of the first connected Apple audio device."""
     env = os.environ.get("AIRPODS_MAC")
     if env:
         return env
-    try:
-        out = subprocess.run(["bluetoothctl", "devices", "Connected"],
-                             capture_output=True, text=True, timeout=5).stdout
-        for mac in re.findall(r"Device ((?:[0-9A-F]{2}:){5}[0-9A-F]{2})", out):
-            info = subprocess.run(["bluetoothctl", "info", mac],
-                                  capture_output=True, text=True, timeout=5).stdout
-            if f"Modalias: bluetooth:v{APPLE_VENDOR}" in info and "Audio Sink" in info:
-                return mac
-    except (OSError, subprocess.TimeoutExpired) as e:
-        raise AirPodsError(f"bluetoothctl is unavailable: {e}")
+    macs = _apple_audio_devices("Connected")
+    if macs:
+        return macs[0]
     raise AirPodsError("No connected AirPods found")
+
+
+def connect_bluetooth():
+    """Ask BlueZ to connect the paired AirPods (audio profiles included)."""
+    macs = [os.environ["AIRPODS_MAC"]] if os.environ.get("AIRPODS_MAC") else _apple_audio_devices("Paired")
+    if not macs:
+        raise AirPodsError("No paired AirPods found")
+    for mac in macs:
+        try:
+            out = subprocess.run(["bluetoothctl", "--timeout", "20", "connect", mac],
+                                 capture_output=True, text=True, timeout=25).stdout
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise AirPodsError(f"Could not connect to {mac}: {e}")
+        if "Connection successful" in out:
+            return mac
+    raise AirPodsError("AirPods did not connect. Open the case near the computer")
 
 
 class AirPods:

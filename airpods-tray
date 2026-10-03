@@ -23,7 +23,7 @@ ASSETS = os.path.join(HERE, "assets")
 UI = os.path.join(ASSETS, "ui")
 sys.path.insert(0, HERE)
 from airpods_aap import (CASE, CMD_ALLOW_OFF_MODE, CMD_ONE_BUD_ANC, LEFT, MODE_TITLES, MODES, RIGHT,  # noqa: E402
-                         AirPods, AirPodsError, find_airpods)
+                         AirPods, AirPodsError, connect_bluetooth, find_airpods)
 
 from PySide6.QtCore import (Property, QEasingCurve, QObject, QPoint, QPointF,  # noqa: E402
                             QPropertyAnimation, QRectF, QSocketNotifier, Qt, QTimer,
@@ -80,7 +80,7 @@ class Design:
     buttons = [QRectF(90, 352.5, 64, 64), QRectF(166, 352.5, 64, 64)]
     # Glyph SVG boxes as exported: ANC 64×64, transparency 64×64.5, same origin as the disc.
     glyph_boxes = {ANC: (64, 64.0), TRANSPARENCY: (64, 64.5)}
-    relaunch = QPointF(24, 441)
+    connect_link = QPointF(24, 441)
     minimize = QRectF(266, 16, 16, 16)
     close = QRectF(288, 16, 16, 16)
 
@@ -247,6 +247,16 @@ class Assets:
         self.bud = sprite.copy(0, 0, sprite.width() // 2, sprite.height())
         self._cache = {}
 
+    def bud_hit(self, pos, mirror):
+        """True if `pos` (relative to the earbud's top-left) lands on the earbud itself."""
+        w, h = Design.bud_size
+        if not (0 <= pos.x() < w and 0 <= pos.y() < h):
+            return False
+        x = int(pos.x() / w * self.bud.width())
+        if mirror:
+            x = self.bud.width() - 1 - x
+        return self.bud.pixelColor(x, int(pos.y() / h * self.bud.height())).alpha() > 40
+
     def bud_pixmap(self, dpr, mirror):
         key = (dpr, mirror)
         if key not in self._cache:
@@ -280,6 +290,7 @@ class Connection(QObject):
     rejected = Signal(int, int)  # requested mode, mode the AirPods kept
     _opened = Signal(object)
     _failed = Signal(str)
+    _bt_done = Signal(str)  # error message, empty on success
 
     def __init__(self):
         super().__init__()
@@ -287,11 +298,13 @@ class Connection(QObject):
         self.error = "Looking for AirPods…"
         self._notifier = None
         self._connecting = False
+        self.bt_connecting = False  # "Connect" pressed, BlueZ is bringing the AirPods up
         self._pending_mode = None
         self._auto_paused = []  # MPRIS players paused by ear detection
         self._case_level = _load_case_level()
         self._opened.connect(self._on_opened)
         self._failed.connect(self._on_failed)
+        self._bt_done.connect(self._on_bt_done)
         self._timer = QTimer(self, interval=RECONNECT_MS, timeout=self.connect_now)
         self._timer.start()
         QTimer.singleShot(0, self.connect_now)
@@ -305,6 +318,29 @@ class Connection(QObject):
             return
         self._connecting = True
         threading.Thread(target=self._connect_worker, daemon=True).start()
+
+    def connect_bluetooth(self):
+        """Connect the paired AirPods at the Bluetooth level, then open AAP."""
+        if self.connected or self.bt_connecting:
+            return
+        self.bt_connecting = True
+        self.changed.emit()
+        threading.Thread(target=self._bt_worker, daemon=True).start()
+
+    def _bt_worker(self):
+        try:
+            connect_bluetooth()
+        except AirPodsError as e:
+            self._bt_done.emit(str(e))
+        else:
+            self._bt_done.emit("")
+
+    def _on_bt_done(self, message):
+        self.bt_connecting = False
+        if message:
+            self.error = message
+        self.changed.emit()
+        self.connect_now()
 
     def _connect_worker(self):
         try:
@@ -326,6 +362,8 @@ class Connection(QObject):
         # Keep noise cancellation when one bud is taken out instead of the AirPods
         # switching themselves to transparency.
         self._send("send_control", CMD_ONE_BUD_ANC, 0x01)
+        # Every connection starts with both modes off.
+        self.set_mode(OFF)
         self.changed.emit()
 
     def _on_failed(self, message):
@@ -533,16 +571,28 @@ class MainWindow(QWidget):
 
     # ------------------------------------------------------------------ input
 
-    def relaunch_rect(self):
+    def connect_label(self):
+        if self.conn.connected:
+            return "Connected"
+        return "Connecting…" if self.conn.bt_connecting else "Connect"
+
+    def connect_rect(self):
         m = QFontMetricsF(inter(12))
-        return QRectF(Design.relaunch.x(), Design.relaunch.y(), m.horizontalAdvance("Relaunch"), m.height())
+        return QRectF(Design.connect_link.x(), Design.connect_link.y(),
+                      m.horizontalAdvance(self.connect_label()), m.height())
+
+    def connect_enabled(self):
+        return not self.conn.connected and not self.conn.bt_connecting
 
     def hit(self, pos):
         for i, r in enumerate(Design.buttons):
             d = pos - r.center()
             if d.x() ** 2 + d.y() ** 2 <= (r.width() / 2) ** 2:
                 return ("button", i)
-        for name, rect in (("relaunch", self.relaunch_rect()), ("minimize", Design.minimize),
+        for side, origin, mirror in (("left", Design.bud_left, False), ("right", Design.bud_right, True)):
+            if self.assets.bud_hit(pos - origin, mirror):
+                return ("bud", side)
+        for name, rect in (("connect", self.connect_rect()), ("minimize", Design.minimize),
                            ("close", Design.close)):
             if rect.contains(pos):
                 return (name, None)
@@ -550,7 +600,8 @@ class MainWindow(QWidget):
 
     def mouseMoveEvent(self, e):
         kind, i = self.hit(e.position())
-        clickable = kind in ("relaunch", "minimize", "close") or (kind == "button" and self.conn.connected)
+        clickable = (kind in ("minimize", "close") or (kind == "connect" and self.connect_enabled())
+                     or (kind in ("button", "bud") and self.conn.connected))
         self.setCursor(Qt.PointingHandCursor if clickable else Qt.ArrowCursor)
 
     def mousePressEvent(self, e):
@@ -561,14 +612,16 @@ class MainWindow(QWidget):
         if e.button() != Qt.LeftButton:
             return
         kind, i = self.hit(e.position())
-        if kind == "relaunch":
-            relaunch()
+        if kind == "connect":
+            self.conn.connect_bluetooth()
         elif kind == "minimize":
             self.showMinimized()
         elif kind == "close":
             self.hide()
         elif kind == "button":
             self.conn.press_mode(MODE_BUTTONS[i])
+        elif kind == "bud" and self.conn.connected:
+            media.chime(self.conn.pods.mac, i)
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_Escape:
@@ -663,7 +716,9 @@ class MainWindow(QWidget):
 
         p.setPen(Design.subtitle)
         p.setFont(inter(12))
-        p.drawText(self.relaunch_rect(), Qt.AlignLeft | Qt.AlignVCenter, "Relaunch")
+        p.setOpacity(1 if self.connect_enabled() else 0.5)
+        p.drawText(self.connect_rect(), Qt.AlignLeft | Qt.AlignVCenter, self.connect_label())
+        p.setOpacity(1)
 
     def _subtitle(self):
         if not self.conn.connected:
@@ -874,7 +929,7 @@ class Tray(QObject):
             self.widget.popup_at(x, y)
 
     # Right-click menu, drawn by Plasma itself over DBusMenu.
-    MENU_OPEN, MENU_RELAUNCH, MENU_QUIT = 1, 2, 3
+    MENU_OPEN, MENU_RELAUNCH, MENU_QUIT, MENU_CONNECT = 1, 2, 3, 6
     MENU_MODE = 10  # + listening mode value
 
     def menu_items(self):
@@ -885,6 +940,9 @@ class Tray(QObject):
             items.append({"id": self.MENU_MODE + mode, "label": MODE_TITLES[mode],
                           "checked": bool(pods and pods.mode == mode), "enabled": pods is not None})
         items += [{"id": 5, "separator": True},
+                  {"id": self.MENU_CONNECT,
+                   "label": "Connected" if pods else "Connecting…" if self.conn.bt_connecting else "Connect",
+                   "enabled": pods is None and not self.conn.bt_connecting},
                   {"id": self.MENU_RELAUNCH, "label": "Relaunch"},
                   {"id": self.MENU_QUIT, "label": "Quit"}]
         return items
@@ -892,6 +950,8 @@ class Tray(QObject):
     def on_menu_clicked(self, item_id):
         if item_id == self.MENU_OPEN:
             self.window.show_raised()
+        elif item_id == self.MENU_CONNECT:
+            self.conn.connect_bluetooth()
         elif item_id == self.MENU_RELAUNCH:
             relaunch()
         elif item_id == self.MENU_QUIT:
